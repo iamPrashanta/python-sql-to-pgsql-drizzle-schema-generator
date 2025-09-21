@@ -4,13 +4,29 @@
     <title>RAW SQL → Drizzle Schema Code Generator</title>
     <meta charset="utf-8" />
     <style>
+      :root {
+        --accent: #1e90ff;
+        --accent-dark: #1674cc;
+        --ok: #12b886;
+        --ok-dark: #0f9a72;
+        --muted: #f7f7f7;
+        --border: #d0d7de;
+      }
       body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 24px; }
       textarea { width: 100%; max-width: 960px; height: 220px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
-      .btn { display: inline-block; margin: 6px 8px 6px 0; padding: 8px 12px; border: 1px solid #ccc; border-radius: 6px; background:#f7f7f7; cursor:pointer; }
-      .btn-primary { background:#1e90ff; color:#fff; border-color:#1e90ff; }
+      .btn { display: inline-block; margin: 6px 8px 6px 0; padding: 8px 12px; border: 1px solid var(--border); border-radius: 6px; background: var(--muted); cursor: pointer; transition: background .15s, color .15s, border-color .15s; }
+      .btn:hover { background: #eee; }
+      .btn-primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+      .btn-primary:disabled { opacity: .65; cursor: not-allowed; }
+      .btn-ok { background: var(--ok); color: #fff; border-color: var(--ok); }
+      .btn-ok:hover { background: var(--ok-dark); border-color: var(--ok-dark); }
+      .btn-copied { background: #16a34a !important; color: #fff !important; border-color: #16a34a !important; }
+      .btn-clean { background: #fff; border-color: var(--border); }
       .row { margin: 8px 0; }
-      pre { background:#0b1021; color:#e6e6e6; padding: 16px; border-radius: 8px; max-width: 960px; overflow: auto; }
-      .hint { color:#666; font-size: 13px; }
+      pre { background: #0b1021; color: #e6e6e6; padding: 16px; border-radius: 8px; max-width: 960px; overflow: auto; }
+      .hint { color: #666; font-size: 13px; }
+      .toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+      .spacer { flex: 1; }
     </style>
 </head>
 <body>
@@ -21,27 +37,23 @@
           <textarea id="sqlInput" name="sql" placeholder="Paste your CREATE TABLE SQL here..."></textarea>
         </div>
 
-        <div class="row">
+        <div class="row toolbar">
           <button type="button" class="btn" id="btnAddPk">Add PK to first col</button>
           <button type="button" class="btn" id="btnAddIdentity">Add auto increment to first col</button>
-          <button type="submit" class="btn btn-primary">Generate</button>
+          <button type="button" class="btn btn-clean" id="btnClean">Clean</button>
+          <div class="spacer"></div>
+          <button type="button" class="btn btn-primary" id="btnGenerate">Generate code</button>
+          <button type="button" class="btn btn-primary" id="btnGeneratePg">Generate raw Postgres query</button>
         </div>
-        <div class="hint">Tip: The PK/auto-increment buttons modify the SQL in the textarea before submitting.</div>
     </form>
-
-    {% if output %}
-    <h2>Generated Drizzle Code:</h2>
-    <pre id="drizzleOut">{{ output }}</pre>
-    <button type="button" class="btn" id="btnCopy">Copy code</button>
-    {% endif %}
+    <div id="outWrap" style="display:none;">
+  <h2>Generated Drizzle Code:</h2>
+  <pre id="drizzleOut"></pre>
+  <button type="button" class="btn" id="btnCopy">Copy code</button>
+</div>
 
 <script>
-(function() {
-  const sqlInput = document.getElementById('sqlInput');
-  const form = document.getElementById('sqlForm');
-
   function getCreateBody(sql) {
-    // Find first (...) after CREATE TABLE and return indices and inner text
     const createIdx = sql.search(/CREATE\s+TABLE/i);
     if (createIdx === -1) return null;
     const openIdx = sql.indexOf('(', createIdx);
@@ -60,7 +72,6 @@
   }
 
   function splitTopLevel(inner) {
-    // split by commas not inside parens
     const out = [];
     let buf = '', depth = 0;
     for (let i = 0; i < inner.length; i++) {
@@ -77,34 +88,20 @@
   function ensurePrimaryKeyOnFirstCol(sql) {
     const body = getCreateBody(sql);
     if (!body) return sql;
-
     const items = splitTopLevel(body.inner);
     if (!items.length) return sql;
-
-    // Skip table-level constraints at start; find first column line
     let firstIdx = -1;
     for (let i = 0; i < items.length; i++) {
       const u = items[i].toUpperCase();
-      if (!u.startsWith('PRIMARY KEY') &&
-          !u.startsWith('FOREIGN KEY') &&
-          !u.startsWith('UNIQUE') &&
-          !u.startsWith('CHECK') &&
-          !u.startsWith('CONSTRAINT')) {
-        firstIdx = i; break;
-      }
+      if (!u.startsWith('PRIMARY KEY') && !u.startsWith('FOREIGN KEY') && !u.startsWith('UNIQUE') &&
+          !u.startsWith('CHECK') && !u.startsWith('CONSTRAINT')) { firstIdx = i; break; }
     }
     if (firstIdx === -1) return sql;
-
     let first = items[firstIdx];
-    const u = first.toUpperCase();
-    if (!/\bPRIMARY\s+KEY\b/.test(u)) {
-      // Append PRIMARY KEY to the column definition
-      // If line ends with a trailing comma in original context, we’re editing inside array items so no comma here
-      first = first.replace(/\s+$/, '');
-      first = first + ' PRIMARY KEY';
+    if (!/\bPRIMARY\s+KEY\b/i.test(first)) {
+      first = first.replace(/\s+$/, '') + ' PRIMARY KEY';
       items[firstIdx] = first;
     }
-
     const newInner = items.join(',\n  ');
     return sql.slice(0, body.openIdx + 1) + '\n  ' + newInner + '\n' + sql.slice(body.closeIdx);
   }
@@ -112,93 +109,155 @@
   function ensureIdentityOnFirstCol(sql) {
     const body = getCreateBody(sql);
     if (!body) return sql;
-
     const items = splitTopLevel(body.inner);
     if (!items.length) return sql;
-
-    // Find first column definition
     let firstIdx = -1;
     for (let i = 0; i < items.length; i++) {
       const u = items[i].toUpperCase();
-      if (!u.startsWith('PRIMARY KEY') &&
-          !u.startsWith('FOREIGN KEY') &&
-          !u.startsWith('UNIQUE') &&
-          !u.startsWith('CHECK') &&
-          !u.startsWith('CONSTRAINT')) {
-        firstIdx = i; break;
-      }
+      if (!u.startsWith('PRIMARY KEY') && !u.startsWith('FOREIGN KEY') && !u.startsWith('UNIQUE') &&
+          !u.startsWith('CHECK') && !u.startsWith('CONSTRAINT')) { firstIdx = i; break; }
     }
     if (firstIdx === -1) return sql;
-
     let first = items[firstIdx];
-    const u = first.toUpperCase();
 
-    // Ensure integer type exists; if missing a type token, add INT after the column name
-    // Pattern: <name> [type ...]
     const m = first.trim().match(/^([A-Za-z_]\w*)(\s+.+)?$/);
     if (m) {
       const name = m[1];
       const rest = m[2] ? m[2] : '';
-      if (!/\b(BIGINT|SMALLINT|INT|INTEGER)\b/.test(rest.toUpperCase())) {
+      if (!/\b(BIGINT|SMALLINT|INT|INTEGER)\b/i.test(rest)) {
         first = name + ' INT' + (rest || '');
       }
     }
-
-    // Add GENERATED ALWAYS AS IDENTITY
-    if (!/\bGENERATED\s+(ALWAYS|BY\s+DEFAULT)\s+AS\s+IDENTITY\b/.test(first.toUpperCase())) {
-      // place before PRIMARY KEY or at end
-      if (/\bPRIMARY\s+KEY\b/.test(first.toUpperCase())) {
+    if (!/\bGENERATED\s+(ALWAYS|BY\s+DEFAULT)\s+AS\s+IDENTITY\b/i.test(first)) {
+      if (/\bPRIMARY\s+KEY\b/i.test(first)) {
         first = first.replace(/\bPRIMARY\s+KEY\b/i, 'GENERATED ALWAYS AS IDENTITY PRIMARY KEY');
       } else {
         first = first.replace(/\s+$/, '') + ' GENERATED ALWAYS AS IDENTITY';
       }
     }
-
-    // Ensure PRIMARY KEY exists
-    if (!/\bPRIMARY\s+KEY\b/.test(first.toUpperCase())) {
+    if (!/\bPRIMARY\s+KEY\b/i.test(first)) {
       first = first.replace(/\s+$/, '') + ' PRIMARY KEY';
     }
-
     items[firstIdx] = first;
     const newInner = items.join(',\n  ');
     return sql.slice(0, body.openIdx + 1) + '\n  ' + newInner + '\n' + sql.slice(body.closeIdx);
   }
 
-  document.getElementById('btnAddPk').addEventListener('click', function() {
-    const sql = sqlInput.value || '';
-    const updated = ensurePrimaryKeyOnFirstCol(sql);
-    sqlInput.value = updated;
-  });
+  function cleanSql(sql) {
+    if (!sql) return sql;
+    let out = sql.replace(/\r\n/g, '\n');
+    out = out.replace(/[ \t]+\n/g, '\n');
+    out = out.replace(/\n{3,}/g, '\n\n');
+    out = out.replace(/[ ]{2,}/g, ' ');
+    out = out.replace(/`/g, '');
+    return out.trimStart();
+  }
 
-  document.getElementById('btnAddIdentity').addEventListener('click', function() {
-    const sql = sqlInput.value || '';
-    const updated = ensureIdentityOnFirstCol(sql);
-    sqlInput.value = updated;
-  });
+  document.addEventListener('DOMContentLoaded', function() {
+    const sqlInput = document.getElementById('sqlInput');
+    const btnAddPk = document.getElementById('btnAddPk');
+    const btnAddIdentity = document.getElementById('btnAddIdentity');
+    const btnClean = document.getElementById('btnClean');
+    const btnGenerate = document.getElementById('btnGenerate');
+    const btnGeneratePg = document.getElementById('btnGeneratePg');
+    const outWrap = document.getElementById('outWrap');
+    const drizzleOut = document.getElementById('drizzleOut');
+    const btnCopy = document.getElementById('btnCopy');
 
-  const btnCopy = document.getElementById('btnCopy');
-  if (btnCopy) {
-    btnCopy.addEventListener('click', async function() {
-      const pre = document.getElementById('drizzleOut');
-      if (!pre) return;
+    btnAddPk.addEventListener('click', function() {
+      sqlInput.value = ensurePrimaryKeyOnFirstCol(sqlInput.value || '');
+    });
+
+    btnAddIdentity.addEventListener('click', function() {
+      sqlInput.value = ensureIdentityOnFirstCol(sqlInput.value || '');
+    });
+
+    // Clean should normalize, not clear
+    btnClean.addEventListener('click', function() {
+      sqlInput.value = ('');
+      drizzleOut.textContent = ('');
+    });
+
+    btnGenerate.addEventListener('click', async function() {
+      btnGenerate.disabled = true;
+      const prev = btnGenerate.textContent;
+      btnGenerate.textContent = 'Generating...';
       try {
-        await navigator.clipboard.writeText(pre.textContent || '');
-        btnCopy.textContent = 'Copied!';
-        setTimeout(() => (btnCopy.textContent = 'Copy code'), 1200);
-      } catch (e) {
-        // Fallback if Clipboard API not available
-        const ta = document.createElement('textarea');
-        ta.value = pre.textContent || '';
-        document.body.appendChild(ta);
-        ta.select();
-        document.execCommand('copy');
-        document.body.removeChild(ta);
-        btnCopy.textContent = 'Copied!';
-        setTimeout(() => (btnCopy.textContent = 'Copy code'), 1200);
+        const res = await fetch('/api/drizzle', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sql: sqlInput.value || '' })
+        });
+        const data = await res.json();
+        if (!data.ok) throw new Error(data.error || 'Failed');
+        drizzleOut.textContent = data.code || '';
+        outWrap.style.display = 'block';
+      } catch (err) {
+        alert('Error: ' + err.message);
+      } finally {
+        btnGenerate.textContent = prev;
+        btnGenerate.disabled = false;
       }
     });
-  }
-})();
+
+    btnGeneratePg.addEventListener('click', async function() {
+      btnGeneratePg.disabled = true;
+      const prev = btnGeneratePg.textContent;
+      btnGeneratePg.textContent = 'Generating...';
+      try {
+        const res = await fetch('/api/postgres', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sql: sqlInput.value || '' })
+        });
+        const data = await res.json();
+        if (!data.ok) throw new Error(data.error || 'Failed');
+        const w = window.open('', '_blank', 'width=900,height=600');
+        if (w) {
+          const escaped = (data.sql || '').replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+          w.document.write('<pre style="white-space:pre-wrap; font-family:monospace; padding:12px;">' + escaped + '</pre>');
+          w.document.title = 'Raw Postgres Query';
+        } else {
+          alert('Popup blocked: could not open preview window.');
+        }
+      } catch (err) {
+        alert('Error: ' + err.message);
+      } finally {
+        btnGeneratePg.textContent = prev;
+        btnGeneratePg.disabled = false;
+      }
+    });
+
+    // Single copy handler
+    if (btnCopy) {
+      btnCopy.addEventListener('click', async function() {
+        const text = drizzleOut.textContent || '';
+        try {
+          await navigator.clipboard.writeText(text);
+          btnCopy.classList.add('btn-copied');
+          btnCopy.textContent = 'Copied!';
+          setTimeout(() => {
+            btnCopy.classList.remove('btn-copied');
+            btnCopy.textContent = 'Copy code';
+          }, 1200);
+        } catch (e) {
+          const ta = document.createElement('textarea');
+          ta.value = text;
+          document.body.appendChild(ta);
+          ta.select();
+          document.execCommand('copy');
+          document.body.removeChild(ta);
+          btnCopy.classList.add('btn-copied');
+          btnCopy.textContent = 'Copied!';
+          setTimeout(() => {
+            btnCopy.classList.remove('btn-copied');
+            btnCopy.textContent = 'Copy code';
+          }, 1200);
+        }
+      });
+    }
+  });
 </script>
+
 </body>
 </html>

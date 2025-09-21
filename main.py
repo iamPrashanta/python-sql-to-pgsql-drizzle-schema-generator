@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request
+from flask import Flask, render_template, request, jsonify
 import re
 
 app = Flask(__name__)
@@ -450,28 +450,144 @@ def sql_to_drizzle(sql_text: str) -> str:
     lines.append(");")
     return "\n".join(lines)
 
-@app.route("/", methods=["GET", "POST"])
-def index():
-    output = None
-    error = None
-    if request.method == "POST":
-        raw_sql = request.form.get("sql", "")
-        try:
-            output = sql_to_drizzle(raw_sql)
-        except Exception as exc:
-            error = f"Failed to convert SQL: {exc}"
-    return render_template("index.html", output=output, error=error)
+def mysql_to_postgres(sql_text: str) -> str:
+    """
+    Convert a MySQL CREATE TABLE statement to PostgreSQL-compatible SQL (DDL).
+    Scope: single CREATE TABLE at a time; best-effort normalization.
+    - Remove backticks, ENGINE/CHARSET/COMMENT tails.
+    - Convert AUTO_INCREMENT -> GENERATED ALWAYS AS IDENTITY.
+    - Drop UNSIGNED, ZEROFILL.
+    - Map types: TINYINT -> SMALLINT, INT(...) -> INTEGER, BIGINT -> BIGINT,
+      DOUBLE/FLOAT/DECIMAL keep as-is, DATETIME -> TIMESTAMP, LONGTEXT/TEXT -> TEXT,
+      VARCHAR(n) keep, CHAR(n) keep, ENUM -> TEXT (with CHECK omitted for brevity).
+    - Translate boolean-ish TINYINT(1) -> BOOLEAN.
+    - Keep constraints PRIMARY KEY/UNIQUE/FOREIGN KEY with same column lists.
+    """
+    s = (sql_text or "").strip()
+    # unify whitespace and remove backticks
+    s = re.sub(r"`", "", s)
+    s = re.sub(r"\r\n?", "\n", s)
 
-if __name__ == "__main__":
-    app.run(debug=True)
+    # strip MySQL table options after closing paren: ) ENGINE=... DEFAULT CHARSET=...
+    # Find balanced parens block first
+    start = s.find("(")
+    if start != -1:
+        depth = 0
+        end = -1
+        for i in range(start, len(s)):
+            if s[i] == "(":
+                depth += 1
+            elif s[i] == ")":
+                depth -= 1
+                if depth == 0:
+                    end = i
+                    break
+        if end != -1:
+            # keep up to end and remove MySQL tail
+            tail = s[end + 1 :]
+            tail = re.sub(r"\)\s*ENGINE\s*=\s*\w+.*$", ")", s[end:]+tail, flags=re.IGNORECASE)
+            s = s[: end + 1]  # cut after ')'
 
-@app.route("/", methods=["GET", "POST"])
+    # Remove ENGINE/CHARSET/ROW_FORMAT from anywhere as safety
+    s = re.sub(r"\)\s*ENGINE\s*=\s*\w+\b.*?;", ");", s, flags=re.IGNORECASE)
+    s = re.sub(r"DEFAULT\s+CHARSET\s*=\s*\w+\b", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"CHARSET\s*=\s*\w+\b", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"COLLATE\s*=\s*[\w_]+", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"ROW_FORMAT\s*=\s*\w+\b", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"COMMENT\s*=\s*'[^']*'", "", s, flags=re.IGNORECASE)
+
+    # Work inside the column/constraint list
+    m = re.search(r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([A-Za-z_]\w*)\s*\((.*)\)\s*;?", s, re.IGNORECASE | re.DOTALL)
+    if not m:
+        return s
+
+    table = m.group(1)
+    inner = m.group(2).strip()
+
+    # split items by commas not inside parentheses
+    items = [x.strip() for x in re.split(r",(?![^()]*\))", inner) if x.strip()]
+
+    def map_type(segment: str) -> str:
+        seg = segment
+
+        # AUTO_INCREMENT -> GENERATED ALWAYS AS IDENTITY
+        seg = re.sub(
+            r"\bAUTO_INCREMENT\b",
+            "GENERATED ALWAYS AS IDENTITY",
+            seg,
+            flags=re.IGNORECASE,
+        )
+
+        # Remove UNSIGNED / ZEROFILL
+        seg = re.sub(r"\bUNSIGNED\b", "", seg, flags=re.IGNORECASE)
+        seg = re.sub(r"\bZEROFILL\b", "", seg, flags=re.IGNORECASE)
+
+        # TINYINT(1) -> BOOLEAN else TINYINT -> SMALLINT
+        seg_up = seg.upper()
+        if re.search(r"\bTINYINT\s*\(\s*1\s*\)", seg_up):
+            seg = re.sub(r"\bTINYINT\s*\(\s*1\s*\)", "BOOLEAN", seg, flags=re.IGNORECASE)
+        else:
+            seg = re.sub(r"\bTINYINT\b", "SMALLINT", seg, flags=re.IGNORECASE)
+
+        # INT(...) -> INTEGER
+        seg = re.sub(r"\bINT\s*\(\s*\d+\s*\)", "INTEGER", seg, flags=re.IGNORECASE)
+        # plain INT -> INTEGER
+        seg = re.sub(r"\bINT\b", "INTEGER", seg, flags=re.IGNORECASE)
+
+        # DATETIME -> TIMESTAMP
+        seg = re.sub(r"\bDATETIME\b", "TIMESTAMP", seg, flags=re.IGNORECASE)
+
+        # LONGTEXT -> TEXT
+        seg = re.sub(r"\bLONGTEXT\b", "TEXT", seg, flags=re.IGNORECASE)
+
+        # ENUM(...) -> TEXT (simple; could be CHECK later)
+        seg = re.sub(r"\bENUM\s*\([^)]+\)", "TEXT", seg, flags=re.IGNORECASE)
+
+        # DOUBLE precision: leave as DOUBLE PRECISION if appears
+        seg = re.sub(r"\bDOUBLE\s+PRECISION\b", "DOUBLE PRECISION", seg, flags=re.IGNORECASE)
+        # DOUBLE -> DOUBLE PRECISION (Postgres)
+        seg = re.sub(r"\bDOUBLE\b", "DOUBLE PRECISION", seg, flags=re.IGNORECASE)
+
+        # FLOAT keep as FLOAT, DECIMAL/NUMERIC keep
+        return seg
+
+    # Convert each item
+    new_items = []
+    for it in items:
+        up = it.upper()
+        if up.startswith("PRIMARY KEY") or up.startswith("UNIQUE") or up.startswith("FOREIGN KEY") or up.startswith("CHECK") or up.startswith("CONSTRAINT"):
+            # leave constraints mostly as-is
+            new_items.append(it)
+        else:
+            # likely column line
+            new_items.append(map_type(it))
+
+    new_inner = ",\n  ".join(new_items)
+    out = f'CREATE TABLE "{table}" (\n  {new_inner}\n);'
+    return out
+
+@app.route("/api/drizzle", methods=["POST"])
+def api_drizzle():
+    data = request.get_json(silent=True) or {}
+    sql = data.get("sql", "")
+    try:
+        code = sql_to_drizzle(sql)
+        return jsonify({ "ok": True, "code": code })
+    except Exception as e:
+        return jsonify({ "ok": False, "error": str(e) }), 400
+
+@app.route("/api/postgres", methods=["POST"])
+def api_postgres():
+    data = request.get_json(silent=True) or {}
+    sql = data.get("sql", "")
+    try:
+        code = mysql_to_postgres(sql)
+        return jsonify({ "ok": True, "sql": code })
+    except Exception as e:
+        return jsonify({ "ok": False, "error": str(e) }), 400
+@app.route("/", methods=["GET"])
 def index():
-    output = None
-    if request.method == "POST":
-        raw_sql = request.form.get("sql")
-        output = sql_to_drizzle(raw_sql)
-    return render_template("index.html", output=output)
+    return render_template("index.html")
 
 if __name__ == "__main__":
     app.run(debug=True)
